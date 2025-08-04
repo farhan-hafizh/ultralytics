@@ -222,7 +222,7 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
-    def xyxy_to_cxcywh(box: torch.Tensor) -> torch.Tensor:
+    def xyxy_to_cxcywh(self, box: torch.Tensor) -> torch.Tensor:
         x1, y1, x2, y2 = box.unbind(-1)
         w = (x2 - x1).clamp(min=0)
         h = (y2 - y1).clamp(min=0)
@@ -251,7 +251,6 @@ class v8DetectionLoss:
         ratio_pred = w_p / h_p
         ratio_gt = w_g / h_g
         return torch.abs(torch.log(ratio_pred / ratio_gt + eps))  # (N,)
-
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
