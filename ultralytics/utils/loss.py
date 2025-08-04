@@ -147,7 +147,6 @@ class BboxLoss(nn.Module):
 
         return loss_iou, loss_dfl
 
-
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
 
@@ -223,6 +222,37 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
+    def xyxy_to_cxcywh(box: torch.Tensor) -> torch.Tensor:
+        x1, y1, x2, y2 = box.unbind(-1)
+        w = (x2 - x1).clamp(min=0)
+        h = (y2 - y1).clamp(min=0)
+        cx = x1 + 0.5 * w
+        cy = y1 + 0.5 * h
+        return torch.stack((cx, cy, w, h), dim=-1)
+
+    def center_distance_loss(self, pred_boxes_xyxy, gt_boxes_xyxy, eps=1e-6):
+        pred = self.xyxy_to_cxcywh(pred_boxes_xyxy)
+        gt = self.xyxy_to_cxcywh(gt_boxes_xyxy)
+        c_pred = pred[..., :2]
+        c_gt = gt[..., :2]
+        w_gt = gt[..., 2]
+        h_gt = gt[..., 3]
+        dist = torch.norm(c_pred - c_gt, dim=-1)  # L2
+        norm = torch.sqrt(w_gt ** 2 + h_gt ** 2).clamp(min=eps)
+        return dist / norm  # (N,)
+
+    def shape_aspect_ratio_loss(self, pred_boxes_xyxy, gt_boxes_xyxy, eps=1e-6):
+        pred = self.xyxy_to_cxcywh(pred_boxes_xyxy)
+        gt = self.xyxy_to_cxcywh(gt_boxes_xyxy)
+        w_p = pred[..., 2].clamp(min=eps)
+        h_p = pred[..., 3].clamp(min=eps)
+        w_g = gt[..., 2].clamp(min=eps)
+        h_g = gt[..., 3].clamp(min=eps)
+        ratio_pred = w_p / h_p
+        ratio_gt = w_g / h_g
+        return torch.abs(torch.log(ratio_pred / ratio_gt + eps))  # (N,)
+
+
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
         nl, ne = targets.shape
@@ -297,9 +327,26 @@ class v8DetectionLoss:
         # Bbox loss
         if fg_mask.sum():
             target_bboxes /= stride_tensor
-            loss[0], loss[2] = self.bbox_loss(
+            loss_iou, loss_dfl = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
+
+            # geometry-aware auxiliary losses, weighted same as IoU loss
+            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)  # (N,1)
+            center = self.center_distance_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])  # (N,)
+            shape = self.shape_aspect_ratio_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])  # (N,)
+
+            # apply the same per-anchor weight and normalize
+            center_loss = (center * weight.squeeze(-1)).sum() / target_scores_sum
+            shape_loss = (shape * weight.squeeze(-1)).sum() / target_scores_sum
+
+            # fusion: adjust these multipliers or expose via hyp
+            lambda_center = 0.5
+            lambda_shape = 0.25
+
+            # fused localization loss: base IoU + geometry terms
+            loss[0] = loss_iou + lambda_center * center_loss + lambda_shape * shape_loss
+            loss[2] = loss_dfl
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
