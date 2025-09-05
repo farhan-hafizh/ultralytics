@@ -108,7 +108,7 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max=16, inner_giou_ratio=1.5):
+    def __init__(self, reg_max=16, inner_giou_ratio=0.7):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.inner_giou_ratio = inner_giou_ratio
@@ -164,51 +164,13 @@ class BboxLoss(nn.Module):
 
         loss_iou = (l_inner_giou * weight).sum() / (target_scores_sum + eps)
 
-        # ----- DFL -----
-        if self.dfl_loss is not None:
-            # Ensure boolean mask and infer (B, A) from it
-            fg_mask = fg_mask.bool()                      # [B, A]
-            B, A = fg_mask.shape
-
-            # 1) Prepare pred_d -> (N_fg*4, reg_max)
-            #    Accept either [B, A, 4*reg_max] or [B, A, 4, reg_max]
-            if pred_dist.dim() == 3 and pred_dist.size(-1) == 4 * self.reg_max:
-                pred_d = (
-                    pred_dist.view(B, A, 4, self.reg_max)[fg_mask]   # (N_fg, 4, reg_max)
-                    .reshape(-1, self.reg_max)                       # (N_fg*4, reg_max)
-                )
-            elif pred_dist.dim() == 4 and pred_dist.size(-2) == 4 and pred_dist.size(-1) == self.reg_max:
-                # Already [B, A, 4, reg_max]
-                pred_d = (
-                    pred_dist.view(B, A, 4, self.reg_max)[fg_mask]   # (N_fg, 4, reg_max)
-                    .reshape(-1, self.reg_max)                       # (N_fg*4, reg_max)
-                )
-            else:
-                raise RuntimeError(
-                    f"Unexpected pred_dist shape {tuple(pred_dist.shape)}; "
-                    f"expected [B,A,4*reg_max] or [B,A,4,reg_max] with reg_max={self.reg_max}"
-                )
-
-            # 2) Prepare targets -> (N_fg, 4)
-            #    bbox2dist should yield per-anchor LTRB distances.
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max - 1)
-            # Accept [B, A, 4] or [B*A, 4]
-            if target_ltrb.dim() == 2 and target_ltrb.size(-1) == 4:
-                target_ltrb = target_ltrb.view(B, A, 4)
-            elif target_ltrb.dim() == 3 and target_ltrb.size(-1) == 4:
-                # already [B, A, 4]
-                pass
-            else:
-                raise RuntimeError(
-                    f"Unexpected target_ltrb shape {tuple(target_ltrb.shape)}; expected [B,A,4] or [B*A,4]"
-                )
-            target_ltrb_fg = target_ltrb[fg_mask]  # (N_fg, 4)
-
-            # 3) DFLoss returns (N_fg, 1); weight is (N_fg, 1)
-            dfl_per_sample = self.dfl_loss(pred_d, target_ltrb_fg)   # (N_fg, 1)
-            loss_dfl = (dfl_per_sample * weight).sum() / (target_scores_sum + 1e-7)
+         # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
         else:
-            loss_dfl = pred_bboxes.new_tensor(0.0)
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
         return loss_iou, loss_dfl
 
