@@ -166,19 +166,46 @@ class BboxLoss(nn.Module):
 
         # ----- DFL -----
         if self.dfl_loss is not None:
-            # target_ltrb: (N_all, 4) distances, we select fg and keep (N_fg, 4)
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max - 1)  # (N_all, 4)
-            target_ltrb_fg = target_ltrb[fg_mask]                                    # (N_fg, 4)
+            # Ensure boolean mask and infer (B, A) from it
+            fg_mask = fg_mask.bool()                      # [B, A]
+            B, A = fg_mask.shape
 
-            # pred_dist: logits; ensure it becomes (N_fg*4, reg_max)
-            # If pred_dist is (N_all, 4*self.reg_max), first reshape to (N_all, 4, self.reg_max)
-            # then select fg and flatten to (N_fg*4, self.reg_max)
-            pred_d = pred_dist.reshape(-1, 4, self.reg_max)[fg_mask].reshape(-1, self.reg_max)
+            # 1) Prepare pred_d -> (N_fg*4, reg_max)
+            #    Accept either [B, A, 4*reg_max] or [B, A, 4, reg_max]
+            if pred_dist.dim() == 3 and pred_dist.size(-1) == 4 * self.reg_max:
+                pred_d = (
+                    pred_dist.view(B, A, 4, self.reg_max)[fg_mask]   # (N_fg, 4, reg_max)
+                    .reshape(-1, self.reg_max)                       # (N_fg*4, reg_max)
+                )
+            elif pred_dist.dim() == 4 and pred_dist.size(-2) == 4 and pred_dist.size(-1) == self.reg_max:
+                # Already [B, A, 4, reg_max]
+                pred_d = (
+                    pred_dist.view(B, A, 4, self.reg_max)[fg_mask]   # (N_fg, 4, reg_max)
+                    .reshape(-1, self.reg_max)                       # (N_fg*4, reg_max)
+                )
+            else:
+                raise RuntimeError(
+                    f"Unexpected pred_dist shape {tuple(pred_dist.shape)}; "
+                    f"expected [B,A,4*reg_max] or [B,A,4,reg_max] with reg_max={self.reg_max}"
+                )
 
-            # DFLoss returns (N_fg, 1)
-            dfl_per_sample = self.dfl_loss(pred_d, target_ltrb_fg)  # (N_fg, 1)
+            # 2) Prepare targets -> (N_fg, 4)
+            #    bbox2dist should yield per-anchor LTRB distances.
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max - 1)
+            # Accept [B, A, 4] or [B*A, 4]
+            if target_ltrb.dim() == 2 and target_ltrb.size(-1) == 4:
+                target_ltrb = target_ltrb.view(B, A, 4)
+            elif target_ltrb.dim() == 3 and target_ltrb.size(-1) == 4:
+                # already [B, A, 4]
+                pass
+            else:
+                raise RuntimeError(
+                    f"Unexpected target_ltrb shape {tuple(target_ltrb.shape)}; expected [B,A,4] or [B*A,4]"
+                )
+            target_ltrb_fg = target_ltrb[fg_mask]  # (N_fg, 4)
 
-            # weight is (N_fg, 1) -> elementwise product, then normalize
+            # 3) DFLoss returns (N_fg, 1); weight is (N_fg, 1)
+            dfl_per_sample = self.dfl_loss(pred_d, target_ltrb_fg)   # (N_fg, 1)
             loss_dfl = (dfl_per_sample * weight).sum() / (target_scores_sum + 1e-7)
         else:
             loss_dfl = pred_bboxes.new_tensor(0.0)
