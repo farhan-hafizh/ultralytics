@@ -109,34 +109,79 @@ class BboxLoss(nn.Module):
     """Criterion class for computing training losses during training."""
 
     def __init__(self, reg_max=16, inner_giou_ratio=1.5):
-        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.inner_giou_ratio = inner_giou_ratio
-        # self.inner_giou_ratio = nn.Parameter(torch.tensor(inner_giou_ratio))
+        self.reg_max = reg_max  # <-- fix
 
+    @staticmethod
+    def inner_iou_xyxy(box1_xyxy, box2_xyxy, ratio=1.0, eps=1e-7):
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1_xyxy.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2_xyxy.chunk(4, -1)
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """IoU loss."""
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(
-            pred_bboxes[fg_mask],
-            target_bboxes[fg_mask],
-            xywh=False,
-            GIoU=True,         # or set GIoU=True to get a GIoU-based portion
-            InnerGIoU=True,    # toggles the Inner-GIoU logic
-            ratio=self.inner_giou_ratio
-            # ratio=torch.sigmoid(self.inner_giou_ratio) * 1.5
+        x1c = (b1_x1 + b1_x2) / 2
+        y1c = (b1_y1 + b1_y2) / 2
+        x2c = (b2_x1 + b2_x2) / 2
+        y2c = (b2_y1 + b2_y2) / 2
+
+        w1 = (b1_x2 - b1_x1).clamp(min=0)
+        h1 = (b1_y2 - b1_y1).clamp(min=0)
+        w2 = (b2_x2 - b2_x1).clamp(min=0)
+        h2 = (b2_y2 - b2_y1).clamp(min=0)
+
+        w1s, h1s = w1 * ratio, h1 * ratio
+        w2s, h2s = w2 * ratio, h2 * ratio
+
+        b1_x1_s, b1_x2_s = x1c - w1s / 2, x1c + w1s / 2
+        b1_y1_s, b1_y2_s = y1c - h1s / 2, y1c + h1s / 2
+        b2_x1_s, b2_x2_s = x2c - w2s / 2, x2c + w2s / 2
+        b2_y1_s, b2_y2_s = y2c - h2s / 2, y2c + h2s / 2
+
+        inter_s = (torch.min(b1_x2_s, b2_x2_s) - torch.max(b1_x1_s, b2_x1_s)).clamp(min=0) * \
+                  (torch.min(b1_y2_s, b2_y2_s) - torch.max(b1_y1_s, b2_y1_s)).clamp(min=0)
+
+        union_s = (w1s * h1s) + (w2s * h2s) - inter_s + eps
+        return inter_s / union_s
+
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes,
+                target_scores, target_scores_sum, fg_mask):
+
+        eps = 1e-7
+        # weights per foreground sample
+        weight = target_scores.sum(-1)[fg_mask].clamp_min(eps)  # (N_fg,)
+        weight = weight.unsqueeze(-1)  # (N_fg, 1) for clean broadcasting
+
+        # Metrics
+        giou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True)
+        iou  = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=False)
+
+        iou_inner = self.inner_iou_xyxy(
+            pred_bboxes[fg_mask], target_bboxes[fg_mask], ratio=self.inner_giou_ratio
         )
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
-        # DFL loss
-        if self.dfl_loss:
-            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
-            loss_dfl = loss_dfl.sum() / target_scores_sum
+        # Eq. (6): L_Inner-GIoU = (1 - GIoU) + IoU - IoU_inner
+        l_inner_giou = (1.0 - giou) + iou - iou_inner
+
+        loss_iou = (l_inner_giou * weight).sum() / (target_scores_sum + eps)
+
+        # ----- DFL -----
+        if self.dfl_loss is not None:
+            # target_ltrb: (N_all, 4) distances, we select fg and keep (N_fg, 4)
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max - 1)  # (N_all, 4)
+            target_ltrb_fg = target_ltrb[fg_mask]                                    # (N_fg, 4)
+
+            # pred_dist: logits; ensure it becomes (N_fg*4, reg_max)
+            # If pred_dist is (N_all, 4*self.reg_max), first reshape to (N_all, 4, self.reg_max)
+            # then select fg and flatten to (N_fg*4, self.reg_max)
+            pred_d = pred_dist.reshape(-1, 4, self.reg_max)[fg_mask].reshape(-1, self.reg_max)
+
+            # DFLoss returns (N_fg, 1)
+            dfl_per_sample = self.dfl_loss(pred_d, target_ltrb_fg)  # (N_fg, 1)
+
+            # weight is (N_fg, 1) -> elementwise product, then normalize
+            loss_dfl = (dfl_per_sample * weight).sum() / (target_scores_sum + 1e-7)
         else:
-            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+            loss_dfl = pred_bboxes.new_tensor(0.0)
 
         return loss_iou, loss_dfl
 
