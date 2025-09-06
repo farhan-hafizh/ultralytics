@@ -112,7 +112,17 @@ class BboxLoss(nn.Module):
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.inner_giou_ratio = inner_giou_ratio
-        self.reg_max = reg_max  # <-- fix
+        self.reg_max = reg_max
+
+        # -------- internal defaults (no API change) --------
+        # base schedule for non-tiny boxes (centered around inner_giou_ratio)
+        self._r_min = float(inner_giou_ratio)                       # e.g., 0.7
+        self._r_max = float(min(0.95, inner_giou_ratio + 0.3))      # e.g., 0.9~1.0 capped
+
+        # tiny-object handling
+        self._tiny_rel_area_thresh = 0.05   # <5% of robust "large" box → tiny
+        self._tiny_r_min = 0.80             # gentler shrink for tiny boxes
+        self._tiny_r_max = 0.95
 
     @staticmethod
     def inner_iou_xyxy(box1_xyxy, box2_xyxy, ratio=1.0, eps=1e-7):
@@ -147,33 +157,60 @@ class BboxLoss(nn.Module):
                 target_scores, target_scores_sum, fg_mask):
 
         eps = 1e-7
-        # weights per foreground sample
-        weight = target_scores.sum(-1)[fg_mask].clamp_min(eps)  # (N_fg,)
-        weight = weight.unsqueeze(-1)  # (N_fg, 1) for clean broadcasting
 
-        # Metrics
+        # per-foreground weight
+        weight = target_scores.sum(-1)[fg_mask].clamp_min(eps).unsqueeze(-1)  # (N_fg,1)
+
+        # IoUs
         giou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True)
         iou  = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=False)
 
-        iou_inner = self.inner_iou_xyxy(
-            pred_bboxes[fg_mask], target_bboxes[fg_mask], ratio=self.inner_giou_ratio
+        # ---------- tiny-object handling ----------
+        tb = target_bboxes[fg_mask]  # (N_fg,4) xyxy
+        tw = (tb[:, 2] - tb[:, 0]).clamp_min(1e-6)
+        th = (tb[:, 3] - tb[:, 1]).clamp_min(1e-6)
+        tarea = tw * th
+
+        # robust reference area (95th percentile) to reduce outlier influence
+        ref = torch.nanquantile(tarea.detach(), 0.95) + 1e-6 if tarea.numel() else tarea.new_tensor(1.0)
+
+        tiny_mask = (tarea / ref) < self._tiny_rel_area_thresh
+
+        # choose per-sample ratio range: tiny → gentler shrink
+        rmin_eff = torch.where(
+            tiny_mask, target_bboxes.new_tensor(self._tiny_r_min),
+                    target_bboxes.new_tensor(self._r_min)
+        )
+        rmax_eff = torch.where(
+            tiny_mask, target_bboxes.new_tensor(self._tiny_r_max),
+                    target_bboxes.new_tensor(self._r_max)
         )
 
-        # Eq. (6): L_Inner-GIoU = (1 - GIoU) + IoU - IoU_inner
-        l_inner_giou = (1.0 - giou) + iou - iou_inner
+        # IoU-adaptive inner ratio within that range
+        ratio_adapt = (rmin_eff + (rmax_eff - rmin_eff) * iou.detach()).clamp(rmin_eff, rmax_eff)
 
+
+        ratio_adapt = ratio_adapt.unsqueeze(-1)  # (N_fg,1)
+
+        # inner IoU
+        iou_inner = self.inner_iou_xyxy(pred_bboxes[fg_mask], target_bboxes[fg_mask], ratio=ratio_adapt)
+
+        # L_Inner-GIoU = (1 - GIoU) + IoU - IoU_inner
+        l_inner_giou = (1.0 - giou) + iou - iou_inner
         loss_iou = (l_inner_giou * weight).sum() / (target_scores_sum + eps)
 
-         # DFL loss
+        # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
-            loss_dfl = loss_dfl.sum() / target_scores_sum
+            loss_dfl = self.dfl_loss(
+                pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max),
+                target_ltrb[fg_mask]
+            ) * weight
+            loss_dfl = loss_dfl.sum() / (target_scores_sum + eps)
         else:
-            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+            loss_dfl = torch.tensor(0.0, device=pred_dist.device)
 
         return loss_iou, loss_dfl
-
 
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
